@@ -1,14 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from __future__ import annotations
+"""
+Classical Aspect Ratio - SEM primary-particle aspect ratio measurement using classical CV
+========================================================================================
+이 스크립트는 고전적인 영상 처리 기법을 사용하여 SEM 이미지 내의 rod-like 입자를 검출하고
+종횡비(Aspect Ratio)를 측정합니다.
 
-import argparse
+전체 처리 흐름:
+1. 입력 이미지 로드 (grayscale + BGR)
+2. secondary particle ROI 검출
+   - 하단 스케일바 제거
+   - threshold + morphology로 가장 큰 입자 영역 추출
+3. ROI 내부에서 rod-like texture 강조
+   - CLAHE, gradient, blackhat, Laplacian 결합
+4. adaptive threshold로 binary segmentation 수행
+5. morphology(open/close)로 노이즈 제거
+6. contour 추출 및 형상 정보 계산
+7. 조건 기반 필터링 (측정 가능한 입자만 선택)
+8. 결과 저장 및 시각화
+========================================================================================
+"""
+
+from __future__ import annotations
+import typing as tp
+
 import csv
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -16,374 +36,376 @@ import numpy as np
 
 @dataclass
 class ParticleMeasurement:
-    contour_index: int
-    area: float
-    perimeter: float
-    major_axis: float
-    minor_axis: float
-    aspect_ratio: float
-    angle_deg: float
-    centroid_x: float
-    centroid_y: float
-    solidity: float
-    extent: float
+    """
+    개별 입자의 측정 정보를 담는 데이터 클래스
+    """
+    int_contourIndex: int
+    float_area: float
+    float_perimeter: float
+    float_majorAxis: float
+    float_minorAxis: float
+    float_aspectRatio: float
+    float_angleDeg: float
+    float_centroidX: float
+    float_centroidY: float
+    float_solidity: float
+    float_extent: float
 
 
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+@dataclass
+class AspectRatioConfig:
+    """
+    Aspect Ratio 측정을 위한 설정 데이터 클래스
+    """
+    path_input: Path
+    path_outputDir: Path
+    float_minArea: float = 18.0
+    float_maxArea: float = 900.0
+    float_minAspectRatio: float = 2.0
+    float_maxAspectRatio: float = 12.0
+    float_minSolidity: float = 0.35
+    float_maxSolidity: float = 0.95
+    float_minExtent: float = 0.18
+    float_maxExtent: float = 0.85
+    int_borderMargin: int = 8
 
 
-def load_gray(path: str) -> np.ndarray:
-    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise FileNotFoundError(f"이미지를 읽을 수 없습니다: {path}")
-    return img
+class AspectRatioService:
+    """
+    Classical CV 기반 종횡비 측정 핵심 로직 서비스
+    """
 
+    def __init__(self, obj_config: AspectRatioConfig) -> None:
+        self.obj_config = obj_config
 
-def load_bgr(path: str) -> np.ndarray:
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
-    if img is None:
-        raise FileNotFoundError(f"이미지를 읽을 수 없습니다: {path}")
-    return img
+    def load_gray(self) -> np.ndarray:
+        """그레이스케일 이미지 로드"""
+        str_path = str(self.obj_config.path_input)
+        arr_img = cv2.imread(str_path, cv2.IMREAD_GRAYSCALE)
+        if arr_img is None:
+            raise FileNotFoundError(f"이미지를 읽을 수 없습니다: {str_path}")
+        return arr_img
 
+    def load_bgr(self) -> np.ndarray:
+        """BGR 컬러 이미지 로드"""
+        str_path = str(self.obj_config.path_input)
+        arr_img = cv2.imread(str_path, cv2.IMREAD_COLOR)
+        if arr_img is None:
+            raise FileNotFoundError(f"이미지를 읽을 수 없습니다: {str_path}")
+        return arr_img
 
-def save_image(path: Path, img: np.ndarray) -> None:
-    cv2.imwrite(str(path), img)
+    def normalize_uint8(self, arr_img: np.ndarray) -> np.ndarray:
+        """이미지 정규화 (0~255 uint8)"""
+        arr_f32 = arr_img.astype(np.float32)
+        float_mn = float(arr_f32.min())
+        float_mx = float(arr_f32.max())
+        if float_mx - float_mn < 1e-8:
+            return np.zeros_like(arr_img, dtype=np.uint8)
+        arr_out = (arr_f32 - float_mn) / (float_mx - float_mn)
+        return (arr_out * 255.0).clip(0, 255).astype(np.uint8)
 
+    def remove_bottom_annotation(self, arr_gray: np.ndarray, float_cropRatio: float = 0.12) -> np.ndarray:
+        """하단 스케일바 영역 제거"""
+        int_h, _ = arr_gray.shape
+        arr_out = arr_gray.copy()
+        int_cutY = int(int_h * (1.0 - float_cropRatio))
+        arr_out[int_cutY:, :] = 0
+        return arr_out
 
-def normalize_uint8(img: np.ndarray) -> np.ndarray:
-    img = img.astype(np.float32)
-    mn = float(img.min())
-    mx = float(img.max())
-    if mx - mn < 1e-8:
-        return np.zeros_like(img, dtype=np.uint8)
-    out = (img - mn) / (mx - mn)
-    return (out * 255.0).clip(0, 255).astype(np.uint8)
+    def detect_roi(self, arr_gray: np.ndarray) -> np.ndarray:
+        """Secondary particle ROI 검출"""
+        arr_work = self.remove_bottom_annotation(arr_gray, float_cropRatio=0.12)
+        arr_blur = cv2.GaussianBlur(arr_work, (9, 9), 0)
+        _, arr_th = cv2.threshold(arr_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
+        arr_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        arr_th = cv2.morphologyEx(arr_th, cv2.MORPH_CLOSE, arr_kernel, iterations=2)
+        arr_th = cv2.morphologyEx(arr_th, cv2.MORPH_OPEN, arr_kernel, iterations=1)
 
-def masked_image(gray: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    out = gray.copy()
-    out[mask == 0] = 0
-    return out
+        list_contours, _ = cv2.findContours(arr_th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        arr_roiMask = np.zeros_like(arr_gray, dtype=np.uint8)
 
+        if not list_contours:
+            arr_roiMask[:, :] = 255
+            return arr_roiMask
 
-def remove_bottom_annotation(gray: np.ndarray, crop_ratio: float = 0.12) -> np.ndarray:
-    h, _ = gray.shape
-    out = gray.copy()
-    cut_y = int(h * (1.0 - crop_ratio))
-    out[cut_y:, :] = 0
-    return out
+        arr_largest = max(list_contours, key=cv2.contourArea)
+        cv2.drawContours(arr_roiMask, [arr_largest], -1, 255, thickness=-1)
 
+        arr_erodeKernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        arr_roiMask = cv2.erode(arr_roiMask, arr_erodeKernel, iterations=1)
+        return arr_roiMask
 
-def detect_secondary_particle_roi(gray: np.ndarray) -> np.ndarray:
-    work = remove_bottom_annotation(gray, crop_ratio=0.12)
-    blur = cv2.GaussianBlur(work, (9, 9), 0)
-    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    def enhance_texture(self, arr_grayRoi: np.ndarray) -> tp.Dict[str, np.ndarray]:
+        """rod-like texture 강조"""
+        obj_clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        arr_claheImg = obj_clahe.apply(arr_grayRoi)
+        arr_blur = cv2.GaussianBlur(arr_claheImg, (3, 3), 0)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+        arr_kernelBh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        arr_blackhat = cv2.morphologyEx(arr_blur, cv2.MORPH_BLACKHAT, arr_kernelBh)
 
-    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    roi_mask = np.zeros_like(gray, dtype=np.uint8)
+        arr_kernelGrad = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        arr_gradient = cv2.morphologyEx(arr_blur, cv2.MORPH_GRADIENT, arr_kernelGrad)
 
-    if not contours:
-        roi_mask[:, :] = 255
-        return roi_mask
+        arr_lap = cv2.Laplacian(arr_blur, cv2.CV_32F, ksize=3)
+        arr_lapAbs = self.normalize_uint8(np.abs(arr_lap))
 
-    largest = max(contours, key=cv2.contourArea)
-    cv2.drawContours(roi_mask, [largest], -1, 255, thickness=-1)
+        arr_combined = cv2.addWeighted(arr_gradient, 0.45, arr_blackhat, 0.35, 0)
+        arr_combined = cv2.addWeighted(arr_combined, 0.80, arr_lapAbs, 0.20, 0)
+        arr_combined = self.normalize_uint8(arr_combined)
 
-    erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    roi_mask = cv2.erode(roi_mask, erode_kernel, iterations=1)
-    return roi_mask
-
-
-def enhance_rod_texture(gray_roi: np.ndarray) -> dict[str, np.ndarray]:
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    clahe_img = clahe.apply(gray_roi)
-    blur = cv2.GaussianBlur(clahe_img, (3, 3), 0)
-
-    kernel_bh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    blackhat = cv2.morphologyEx(blur, cv2.MORPH_BLACKHAT, kernel_bh)
-
-    kernel_grad = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    gradient = cv2.morphologyEx(blur, cv2.MORPH_GRADIENT, kernel_grad)
-
-    lap = cv2.Laplacian(blur, cv2.CV_32F, ksize=3)
-    lap_abs = normalize_uint8(np.abs(lap))
-
-    combined = cv2.addWeighted(gradient, 0.45, blackhat, 0.35, 0)
-    combined = cv2.addWeighted(combined, 0.80, lap_abs, 0.20, 0)
-    combined = normalize_uint8(combined)
-
-    return {
-        "clahe": clahe_img,
-        "blur": blur,
-        "blackhat": blackhat,
-        "gradient": gradient,
-        "laplacian_abs": lap_abs,
-        "combined": combined,
-    }
-
-
-def segment_classical(gray: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    roi_mask = detect_secondary_particle_roi(gray)
-    gray_roi = masked_image(gray, roi_mask)
-    enhanced = enhance_rod_texture(gray_roi)
-    work = enhanced["combined"]
-
-    binary = cv2.adaptiveThreshold(
-        work,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        19,
-        -2,
-    )
-    binary[roi_mask == 0] = 0
-
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_open, iterations=1)
-
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    cleaned = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel_close, iterations=1)
-
-    debug = {
-        "roi_mask": roi_mask,
-        "gray_roi": gray_roi,
-        **enhanced,
-        "binary": binary,
-        "opened": opened,
-        "cleaned": cleaned,
-    }
-    return cleaned, debug
-
-
-def contour_measurement(contour: np.ndarray, contour_index: int) -> Optional[ParticleMeasurement]:
-    area = float(cv2.contourArea(contour))
-    if area <= 1.0:
-        return None
-
-    perimeter = float(cv2.arcLength(contour, True))
-    if len(contour) < 5:
-        x, y, w, h = cv2.boundingRect(contour)
-        major_axis = float(max(w, h))
-        minor_axis = float(max(1.0, min(w, h)))
-        angle_deg = 0.0
-        cx = x + w / 2.0
-        cy = y + h / 2.0
-    else:
-        (cx, cy), (a1, a2), angle_deg = cv2.fitEllipse(contour)
-        major_axis = float(max(a1, a2))
-        minor_axis = float(max(1e-6, min(a1, a2)))
-
-    aspect_ratio = float(major_axis / minor_axis)
-
-    hull = cv2.convexHull(contour)
-    hull_area = float(cv2.contourArea(hull))
-    solidity = float(area / hull_area) if hull_area > 1e-8 else 0.0
-
-    x, y, w, h = cv2.boundingRect(contour)
-    rect_area = float(w * h)
-    extent = float(area / rect_area) if rect_area > 1e-8 else 0.0
-
-    return ParticleMeasurement(
-        contour_index=contour_index,
-        area=area,
-        perimeter=perimeter,
-        major_axis=major_axis,
-        minor_axis=minor_axis,
-        aspect_ratio=aspect_ratio,
-        angle_deg=float(angle_deg),
-        centroid_x=float(cx),
-        centroid_y=float(cy),
-        solidity=solidity,
-        extent=extent,
-    )
-
-
-def extract_contours(mask: np.ndarray) -> list[np.ndarray]:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return contours
-
-
-def filter_measurable_rods(
-    contours: list[np.ndarray],
-    min_area: float,
-    max_area: float,
-    min_aspect_ratio: float,
-    max_aspect_ratio: float,
-    min_solidity: float,
-    max_solidity: float,
-    min_extent: float,
-    max_extent: float,
-    border_margin: int,
-    image_shape: tuple[int, int],
-) -> tuple[list[np.ndarray], list[ParticleMeasurement]]:
-    h, w = image_shape
-    kept_contours: list[np.ndarray] = []
-    kept_measurements: list[ParticleMeasurement] = []
-
-    for idx, contour in enumerate(contours):
-        m = contour_measurement(contour, idx)
-        if m is None:
-            continue
-        if not (min_area <= m.area <= max_area):
-            continue
-        if not (min_aspect_ratio <= m.aspect_ratio <= max_aspect_ratio):
-            continue
-        if not (min_solidity <= m.solidity <= max_solidity):
-            continue
-        if not (min_extent <= m.extent <= max_extent):
-            continue
-        if (
-            m.centroid_x < border_margin
-            or m.centroid_x > (w - border_margin)
-            or m.centroid_y < border_margin
-            or m.centroid_y > (h - border_margin)
-        ):
-            continue
-        kept_contours.append(contour)
-        kept_measurements.append(m)
-
-    return kept_contours, kept_measurements
-
-
-def draw_measurements_overlay(
-    image_bgr: np.ndarray,
-    contours: list[np.ndarray],
-    measurements: list[ParticleMeasurement],
-) -> np.ndarray:
-    out = image_bgr.copy()
-    cv2.drawContours(out, contours, -1, (0, 255, 0), 1)
-
-    for contour, m in zip(contours, measurements):
-        cx = int(round(m.centroid_x))
-        cy = int(round(m.centroid_y))
-        if len(contour) >= 5:
-            ellipse = cv2.fitEllipse(contour)
-            cv2.ellipse(out, ellipse, (255, 0, 0), 1)
-        cv2.putText(
-            out,
-            f"{m.aspect_ratio:.2f}",
-            (cx + 2, cy - 2),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.30,
-            (0, 0, 255),
-            1,
-            cv2.LINE_AA,
-        )
-    return out
-
-
-def compute_summary(measurements: list[ParticleMeasurement]) -> dict:
-    if not measurements:
         return {
-            "count": 0,
-            "mean_aspect_ratio": None,
-            "median_aspect_ratio": None,
-            "std_aspect_ratio": None,
-            "min_aspect_ratio": None,
-            "max_aspect_ratio": None,
+            "clahe": arr_claheImg,
+            "blur": arr_blur,
+            "blackhat": arr_blackhat,
+            "gradient": arr_gradient,
+            "laplacian_abs": arr_lapAbs,
+            "combined": arr_combined,
         }
 
-    arr = np.array([m.aspect_ratio for m in measurements], dtype=np.float32)
-    return {
-        "count": int(len(measurements)),
-        "mean_aspect_ratio": float(np.mean(arr)),
-        "median_aspect_ratio": float(np.median(arr)),
-        "std_aspect_ratio": float(np.std(arr)),
-        "min_aspect_ratio": float(np.min(arr)),
-        "max_aspect_ratio": float(np.max(arr)),
-    }
+    def segment(self, arr_gray: np.ndarray) -> tp.Tuple[np.ndarray, tp.Dict[str, np.ndarray]]:
+        """Classical segmentation 파이프라인"""
+        arr_roiMask = self.detect_roi(arr_gray)
+        arr_grayRoi = arr_gray.copy()
+        arr_grayRoi[arr_roiMask == 0] = 0
+        
+        dict_enhanced = self.enhance_texture(arr_grayRoi)
+        arr_work = dict_enhanced["combined"]
 
-
-def save_measurements_csv(path: Path, measurements: list[ParticleMeasurement]) -> None:
-    with path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "contour_index",
-                "area",
-                "perimeter",
-                "major_axis",
-                "minor_axis",
-                "aspect_ratio",
-                "angle_deg",
-                "centroid_x",
-                "centroid_y",
-                "solidity",
-                "extent",
-            ],
+        arr_binary = cv2.adaptiveThreshold(
+            arr_work,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            19,
+            -2,
         )
-        writer.writeheader()
-        for m in measurements:
-            writer.writerow(asdict(m))
+        arr_binary[arr_roiMask == 0] = 0
+
+        arr_kernelOpen = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        arr_opened = cv2.morphologyEx(arr_binary, cv2.MORPH_OPEN, arr_kernelOpen, iterations=1)
+
+        arr_kernelClose = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        arr_cleaned = cv2.morphologyEx(arr_opened, cv2.MORPH_CLOSE, arr_kernelClose, iterations=1)
+
+        dict_debug = dict()
+        dict_debug["roi_mask"] = arr_roiMask
+        dict_debug["gray_roi"] = arr_grayRoi
+        for str_k, arr_v in dict_enhanced.items():
+            dict_debug[str_k] = arr_v
+        dict_debug["binary"] = arr_binary
+        dict_debug["opened"] = arr_opened
+        dict_debug["cleaned"] = arr_cleaned
+        
+        return arr_cleaned, dict_debug
+
+    def measure_contour(self, arr_contour: np.ndarray, int_index: int) -> tp.Optional[ParticleMeasurement]:
+        """개별 contour 측정"""
+        float_area = float(cv2.contourArea(arr_contour))
+        if float_area <= 1.0:
+            return None
+
+        float_perimeter = float(cv2.arcLength(arr_contour, True))
+        if len(arr_contour) < 5:
+            int_x, int_y, int_w, int_h = cv2.boundingRect(arr_contour)
+            float_major = float(max(int_w, int_h))
+            float_minor = float(max(1.0, min(int_w, int_h)))
+            float_angle = 0.0
+            float_cx = float(int_x + int_w / 2.0)
+            float_cy = float(int_y + int_h / 2.0)
+        else:
+            (float_cx, float_cy), (float_a1, float_a2), float_angle = cv2.fitEllipse(arr_contour)
+            float_major = float(max(float_a1, float_a2))
+            float_minor = float(max(1e-6, min(float_a1, float_a2)))
+
+        float_ar = float_major / float_minor
+
+        arr_hull = cv2.convexHull(arr_contour)
+        float_hullArea = float(cv2.contourArea(arr_hull))
+        float_solidity = float_area / float_hullArea if float_hullArea > 1e-8 else 0.0
+
+        int_x, int_y, int_w, int_h = cv2.boundingRect(arr_contour)
+        float_rectArea = float(int_w * int_h)
+        float_extent = float_area / float_rectArea if float_rectArea > 1e-8 else 0.0
+
+        return ParticleMeasurement(
+            int_contourIndex=int_index,
+            float_area=float_area,
+            float_perimeter=float_perimeter,
+            float_majorAxis=float_major,
+            float_minorAxis=float_minor,
+            float_aspectRatio=float_ar,
+            float_angleDeg=float(float_angle),
+            float_centroidX=float(float_cx),
+            float_centroidY=float(float_cy),
+            float_solidity=float_solidity,
+            float_extent=float_extent,
+        )
+
+    def process(self) -> tp.Dict[str, tp.Any]:
+        """전체 파이프라인 실행"""
+        self.obj_config.path_outputDir.mkdir(parents=True, exist_ok=True)
+        
+        arr_gray = self.load_gray()
+        arr_bgr = self.load_bgr()
+        int_h, int_w = arr_gray.shape
+
+        arr_mask, dict_debug = self.segment(arr_gray)
+        list_allContours, _ = cv2.findContours(arr_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        list_filteredContours = list()
+        list_measurements = list()
+
+        for int_idx, arr_cnt in enumerate(list_allContours):
+            obj_m = self.measure_contour(arr_cnt, int_idx)
+            if obj_m is None:
+                continue
+            
+            # Filtering criteria
+            if not (self.obj_config.float_minArea <= obj_m.float_area <= self.obj_config.float_maxArea):
+                continue
+            if not (self.obj_config.float_minAspectRatio <= obj_m.float_aspectRatio <= self.obj_config.float_maxAspectRatio):
+                continue
+            if not (self.obj_config.float_minSolidity <= obj_m.float_solidity <= self.obj_config.float_maxSolidity):
+                continue
+            if not (self.obj_config.float_minExtent <= obj_m.float_extent <= self.obj_config.float_maxExtent):
+                continue
+            
+            int_m = self.obj_config.int_borderMargin
+            if (obj_m.float_centroidX < int_m or obj_m.float_centroidX > (int_w - int_m) or
+                obj_m.float_centroidY < int_m or obj_m.float_centroidY > (int_h - int_m)):
+                continue
+
+            list_filteredContours.append(arr_cnt)
+            list_measurements.append(obj_m)
+
+        # Visualization
+        arr_overlay = arr_bgr.copy()
+        cv2.drawContours(arr_overlay, list_filteredContours, -1, (0, 255, 0), 1)
+        for obj_m in list_measurements:
+            int_cx = int(round(obj_m.float_centroidX))
+            int_cy = int(round(obj_m.float_centroidY))
+            cv2.putText(
+                arr_overlay,
+                f"{obj_m.float_aspectRatio:.2f}",
+                (int_cx + 2, int_cy - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.30,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+        # Summary statistics
+        dict_summary = dict()
+        if not list_measurements:
+            dict_summary = {
+                "count": 0,
+                "mean_aspect_ratio": None,
+                "median_aspect_ratio": None,
+                "std_aspect_ratio": None,
+            }
+        else:
+            arr_ars = np.array([obj_m.float_aspectRatio for obj_m in list_measurements], dtype=np.float32)
+            dict_summary = {
+                "count": len(list_measurements),
+                "mean_aspect_ratio": float(np.mean(arr_ars)),
+                "median_aspect_ratio": float(np.median(arr_ars)),
+                "std_aspect_ratio": float(np.std(arr_ars)),
+                "min_aspect_ratio": float(np.min(arr_ars)),
+                "max_aspect_ratio": float(np.max(arr_ars)),
+            }
+
+        # Save results
+        cv2.imwrite(str(self.obj_config.path_outputDir / "01_input_gray.png"), arr_gray)
+        for str_name, arr_img in dict_debug.items():
+            cv2.imwrite(str(self.obj_config.path_outputDir / f"02_{str_name}.png"), arr_img)
+        cv2.imwrite(str(self.obj_config.path_outputDir / "03_final_mask.png"), arr_mask)
+        cv2.imwrite(str(self.obj_config.path_outputDir / "04_overlay.png"), arr_overlay)
+
+        # CSV Save
+        path_csv = self.obj_config.path_outputDir / "measurements.csv"
+        with path_csv.open("w", newline="", encoding="utf-8-sig") as obj_f:
+            if list_measurements:
+                obj_writer = csv.DictWriter(obj_f, fieldnames=list(asdict(list_measurements[0]).keys()))
+                obj_writer.writeheader()
+                for obj_m in list_measurements:
+                    obj_writer.writerow(asdict(obj_m))
+
+        # JSON Save
+        with (self.obj_config.path_outputDir / "summary.json").open("w", encoding="utf-8") as obj_f:
+            json.dump(dict_summary, obj_f, ensure_ascii=False, indent=2)
+
+        return dict_summary
 
 
-def save_json(path: Path, data: dict) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def run(args: argparse.Namespace) -> None:
-    input_path = Path(args.input)
-    output_dir = Path(args.output_dir)
-    ensure_dir(output_dir)
-
-    gray = load_gray(str(input_path))
-    bgr = load_bgr(str(input_path))
-
-    mask, debug = segment_classical(gray)
-    contours = extract_contours(mask)
-    filtered_contours, measurements = filter_measurable_rods(
-        contours=contours,
-        min_area=args.min_area,
-        max_area=args.max_area,
-        min_aspect_ratio=args.min_aspect_ratio,
-        max_aspect_ratio=args.max_aspect_ratio,
-        min_solidity=args.min_solidity,
-        max_solidity=args.max_solidity,
-        min_extent=args.min_extent,
-        max_extent=args.max_extent,
-        border_margin=args.border_margin,
-        image_shape=gray.shape,
+def run_classical_interactive(
+    str_input: str,
+    str_outputDir: str,
+    float_minArea: float = 18.0,
+    float_maxArea: float = 900.0,
+    float_minAspectRatio: float = 2.0,
+    float_maxAspectRatio: float = 12.0,
+    float_minSolidity: float = 0.35,
+    float_maxSolidity: float = 0.95,
+    float_minExtent: float = 0.18,
+    float_maxExtent: float = 0.85,
+    int_borderMargin: int = 8,
+) -> tp.Dict[str, tp.Any]:
+    """Interactive Window에서 호출 가능한 래퍼 함수"""
+    obj_config = AspectRatioConfig(
+        path_input=Path(str_input),
+        path_outputDir=Path(str_outputDir),
+        float_minArea=float_minArea,
+        float_maxArea=float_maxArea,
+        float_minAspectRatio=float_minAspectRatio,
+        float_maxAspectRatio=float_maxAspectRatio,
+        float_minSolidity=float_minSolidity,
+        float_maxSolidity=float_maxSolidity,
+        float_minExtent=float_minExtent,
+        float_maxExtent=float_maxExtent,
+        int_borderMargin=int_borderMargin,
     )
-
-    overlay = draw_measurements_overlay(bgr, filtered_contours, measurements)
-    summary = compute_summary(measurements)
-
-    save_image(output_dir / "01_input_gray.png", gray)
-    for name, img in debug.items():
-        save_image(output_dir / f"02_{name}.png", img)
-    save_image(output_dir / "03_final_mask.png", mask)
-    save_image(output_dir / "04_overlay.png", overlay)
-    save_measurements_csv(output_dir / "measurements.csv", measurements)
-    save_json(output_dir / "summary.json", summary)
-
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Classical segmentation for precursor SEM primary-particle aspect ratio")
-    p.add_argument("--input", type=str, required=True, help="입력 이미지 경로")
-    p.add_argument("--output_dir", type=str, required=True, help="출력 폴더")
-    p.add_argument("--min_area", type=float, default=18.0)
-    p.add_argument("--max_area", type=float, default=900.0)
-    p.add_argument("--min_aspect_ratio", type=float, default=2.0)
-    p.add_argument("--max_aspect_ratio", type=float, default=12.0)
-    p.add_argument("--min_solidity", type=float, default=0.35)
-    p.add_argument("--max_solidity", type=float, default=0.95)
-    p.add_argument("--min_extent", type=float, default=0.18)
-    p.add_argument("--max_extent", type=float, default=0.85)
-    p.add_argument("--border_margin", type=int, default=8)
-    return p
+    obj_service = AspectRatioService(obj_config)
+    return obj_service.process()
 
 
 def main() -> None:
-    args = build_parser().parse_args()
-    run(args)
+    """
+    진입점: 아래 변수들을 직접 수정하여 실행하세요.
+    """
+    # === 사용자 설정 영역 ===
+    str_inputPath = "test.png"              # 입력 이미지 경로
+    str_outputDir = "out_classical"         # 결과 저장 폴더
+    
+    float_minArea = 18.0
+    float_maxArea = 900.0
+    float_minAspectRatio = 2.0
+    float_maxAspectRatio = 12.0
+    float_minSolidity = 0.35
+    float_maxSolidity = 0.95
+    float_minExtent = 0.18
+    float_maxExtent = 0.85
+    int_borderMargin = 8
+    # ========================
+
+    dict_summary = run_classical_interactive(
+        str_input=str_inputPath,
+        str_outputDir=str_outputDir,
+        float_minArea=float_minArea,
+        float_maxArea=float_maxArea,
+        float_minAspectRatio=float_minAspectRatio,
+        float_maxAspectRatio=float_maxAspectRatio,
+        float_minSolidity=float_minSolidity,
+        float_maxSolidity=float_maxSolidity,
+        float_minExtent=float_minExtent,
+        float_maxExtent=float_maxExtent,
+        int_borderMargin=int_borderMargin,
+    )
+    
+    print("===== Classical CV 결과 요약 =====")
+    print(json.dumps(dict_summary, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
